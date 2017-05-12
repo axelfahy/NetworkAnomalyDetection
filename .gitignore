@@ -1,7 +1,7 @@
 ### Specific files ###
 
 # Data
-Data/
+data/
 
 # TagsClassifier temp folders
 derby.log
