@@ -9,6 +9,10 @@
  *  - Gaussian Mixture Model (GMM)
  *  - Latent Dirichlet allocation (LDA)
  *
+ * Categorical features are transformed into numerical features using one-hot encoder.
+ * Afterwards, all features are normalized.
+ *
+ *
  *  Basic implementation is based on the chapter 5 (Anomaly Detection in Network Traffic with K-means clustering) of the book Advanced Analytics with Spark. However, this implementation is using the Dataframe-based API instead of the RDD-based API.
  *
  * @author Axel Fahy
@@ -16,17 +20,16 @@
  * @author Brian Nydegger
  * @author Assaf Mahmoud
  *
- * @date 13.05.2017
+ * @date 15.05.2017
  *
  */
 
+import org.apache.spark.ml.Pipeline
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.types._
-import org.apache.spark.sql.functions._
-import org.apache.spark.ml.clustering.KMeans
-import org.apache.spark.ml.feature.VectorAssembler
-
+import org.apache.spark.ml.clustering.{KMeans, KMeansModel}
+import org.apache.spark.ml.feature.{OneHotEncoder, StandardScaler, StringIndexer, VectorAssembler}
 
 object NetworkAnomalyDetection {
 
@@ -78,6 +81,8 @@ object NetworkAnomalyDetection {
     StructField("dst_host_srv_rerror_rate", DoubleType, true),
     StructField("label", StringType, true)))
 
+  val K = 10
+
   def main(args: Array[String]): Unit = {
     // Creation of configuration and session
     val conf = new SparkConf()
@@ -97,36 +102,58 @@ object NetworkAnomalyDetection {
       .load(DataPath)
 
     // Select only numerical features
-    val nonNumericalColumns = Seq("protocol_type", "service", "flag", "label")
-    //val numericalColumns = rawDataDF.columns.diff(nonNumericalColumns).map(column => col(column))
-    val numericalColumns = rawDataDF.columns.diff(nonNumericalColumns)
+    val categoricalColumns = Seq("protocol_type", "service", "flag")
+    // Remove the label column
+    val dataDF = rawDataDF.drop("label")
+    val numericalColumns = dataDF.columns.diff(categoricalColumns)
     numericalColumns.foreach(println)
-    //val dataNumericalDF = rawDataDF.select(numericalColumns: _*)
-    //val dataDF = rawDataDF.select(concat(numericalColumns.map(c => col(c)): _*))
 
+    // Indexing categorical columns
+    val indexer: Array[org.apache.spark.ml.PipelineStage] = categoricalColumns.map(
+      c => new StringIndexer()
+        .setInputCol(c)
+        .setOutputCol(s"${c}_index")
+    ).toArray
+
+    // Encoding previously indexed columns
+    val encoder: Array[org.apache.spark.ml.PipelineStage] = categoricalColumns.map(
+        c => new OneHotEncoder()
+         .setInputCol(s"${c}_index")
+         .setOutputCol(s"${c}_vec")
+    ).toArray
+
+    // Creation of list of columns for vector assembler (with only numerical columns)
+    val assemblerColumns = (Set(dataDF.columns: _*) -- categoricalColumns ++ categoricalColumns.map(c => s"${c}_vec")).toArray
+
+    // Creation of vector with features
     val assembler = new VectorAssembler()
-      .setInputCols(numericalColumns)
-      .setOutputCol("features")
+      .setInputCols(assemblerColumns)
+      .setOutputCol("featuresVector")
 
-    // Select all numerical features and create a vector
-    val transformed = assembler.transform(rawDataDF)
-    val dataDF = transformed.select("features").cache()
+    // Normalization using standard deviation
+    val scaler = new StandardScaler()
+      .setInputCol("featuresVector")
+      .setOutputCol("scaledFeatureVector")
+      .setWithStd(true)
+      .setWithMean(false)
 
-    val kmeans = new KMeans().setK(2).setSeed(1L)
-    val model = kmeans.fit(dataDF)
+    val kmeans = new KMeans()
+      .setK(K)
+      .setFeaturesCol("scaledFeatureVector")
+      .setPredictionCol("prediction")
+      .setSeed(1L)
 
-    // Evaluate clustering by computing Within Set Sum of Squared Errors.
-    val WSSSE = model.computeCost(dataDF)
+    val pipeline = new Pipeline()
+      .setStages(indexer ++ encoder ++ Array(assembler, scaler, kmeans))
+
+    val pipelineModel = pipeline.fit(dataDF)
+
+    val kmeansModel = pipelineModel.stages.last.asInstanceOf[KMeansModel]
+    val WSSSE = kmeansModel.computeCost(pipelineModel.transform(dataDF))
     println(s"Within Set Sum of Squared Errors = $WSSSE")
 
     // Shows the result.
     println("Cluster Centers: ")
-    model.clusterCenters.foreach(println)
-
-    // TODO: Pipeline + paramGrid
-    // paramGrid: test k from 2 to 200
-    // change epsilon, change the number of iterations
-    // Pipeline: Normalization (standard score) -> K-means -> evaluator (sum of squares)
-    // TODO: Add one-hot encoding for categorical features
+    kmeansModel.clusterCenters.foreach(println)
   }
 }
