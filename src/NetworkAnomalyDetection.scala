@@ -12,24 +12,37 @@
  * Categorical features are transformed into numerical features using one-hot encoder.
  * Afterwards, all features are normalized.
  *
+ * These different implementation are compared.
  *
- *  Basic implementation is based on the chapter 5 (Anomaly Detection in Network Traffic with K-means clustering) of the book Advanced Analytics with Spark. However, this implementation is using the Dataframe-based API instead of the RDD-based API.
+ * Metrics used:
+ *
+ *  - K-means: Within Set Sum of Squared Errors (WSSSE)
+ *  - GMM: Mean, covariance and weights
+ *
+ * Basic implementation is based on the chapter 5 (Anomaly Detection in Network Traffic with K-means clustering)
+ * of the book Advanced Analytics with Spark.
+ * However, this implementation is using the Dataframe-based API instead of the RDD-based API.
  *
  * @author Axel Fahy
  * @author Rudolf Höhn
  * @author Brian Nydegger
  * @author Assaf Mahmoud
  *
- * @date 15.05.2017
+ * @date 18.05.2017
  *
  */
 
-import org.apache.spark.ml.Pipeline
+import java.io.{File, PrintWriter}
+import java.text.SimpleDateFormat
+import java.util.Calendar
+
+import org.apache.spark.ml.{Pipeline, PipelineModel}
 import org.apache.spark.{SparkConf, SparkContext}
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.types._
-import org.apache.spark.ml.clustering.{KMeans, KMeansModel}
+import org.apache.spark.ml.clustering._
 import org.apache.spark.ml.feature.{OneHotEncoder, StandardScaler, StringIndexer, VectorAssembler}
+
 
 object NetworkAnomalyDetection {
 
@@ -81,13 +94,13 @@ object NetworkAnomalyDetection {
     StructField("dst_host_srv_rerror_rate", DoubleType, true),
     StructField("label", StringType, true)))
 
-  val K = 10
-
   def main(args: Array[String]): Unit = {
     // Creation of configuration and session
     val conf = new SparkConf()
       .setMaster("local")
       .setAppName("NetworkAnomalyDetection")
+      .set("spark.driver.memory", "6g")
+
     val sc = new SparkContext(conf)
 
     val spark = SparkSession
@@ -101,59 +114,319 @@ object NetworkAnomalyDetection {
       .schema(DataSchema)
       .load(DataPath)
 
+    val runClustering = new RunClustering(spark, rawDataDF)
+
+    // K-means
+    (20 to 100 by 20).map(k => (k, runClustering.kmeansSimple(k)))
+    (20 to 100 by 20).map(k => (k, runClustering.kmeansOneHotEncoder(k)))
+    (20 to 100 by 20).map(k => (k, runClustering.kmeansOneHotEncoderWithNormalization(k)))
+
+    // Bisecting K-means
+    (20 to 100 by 20).map(k => (k, runClustering.bisectingKmeansOneHotEncoderWithNormalization(k)))
+
+    // Gaussian Mixture
+    (20 to 100 by 20).map(k => (k, runClustering.gaussianMixtureOneHotEncoderWithNormalization(k)))
+  }
+
+  class RunClustering(private val spark: SparkSession, var data: DataFrame) {
+
     // Select only numerical features
-    val categoricalColumns = Seq("protocol_type", "service", "flag")
-    // Remove the label column
-    val dataDF = rawDataDF.drop("label")
-    val numericalColumns = dataDF.columns.diff(categoricalColumns)
-    numericalColumns.foreach(println)
+    val CategoricalColumns = Seq("protocol_type", "service", "flag")
 
-    // Indexing categorical columns
-    val indexer: Array[org.apache.spark.ml.PipelineStage] = categoricalColumns.map(
-      c => new StringIndexer()
-        .setInputCol(c)
-        .setOutputCol(s"${c}_index")
-    ).toArray
+    def kmeansSimple(k: Int): Unit = {
+      println(s"Running kmeansSimple ($k)")
+      val startTime = System.nanoTime()
+      // Remove the label column
+      val dataDF = this.data.drop("label")
+      dataDF.cache()
+      val numericalColumns = dataDF.columns.diff(CategoricalColumns)
 
-    // Encoding previously indexed columns
-    val encoder: Array[org.apache.spark.ml.PipelineStage] = categoricalColumns.map(
+      // Creation of vector with features
+      val assembler = new VectorAssembler()
+        .setInputCols(numericalColumns)
+        .setOutputCol("features")
+
+      val kmeans = new KMeans()
+        .setK(k)
+        .setFeaturesCol("features")
+        .setPredictionCol("prediction")
+        .setSeed(1L)
+
+      val pipeline = new Pipeline()
+        .setStages(Array(assembler, kmeans))
+
+      val pipelineModel = pipeline.fit(dataDF)
+      dataDF.unpersist()
+
+      this.kmeansComputeCost(pipelineModel, "K-means (" + k + ") simple")
+      val duration = (System.nanoTime - startTime) / 1e9d
+      println(s"Duration: $duration")
+    }
+
+    def kmeansOneHotEncoder(k: Int): Unit = {
+      println(s"Running kmeansOneHotEncoder ($k)")
+      // Remove the label column
+      val dataDF = this.data.drop("label")
+      dataDF.cache()
+
+      // Indexing categorical columns
+      val indexer: Array[org.apache.spark.ml.PipelineStage] = CategoricalColumns.map(
+        c => new StringIndexer()
+          .setInputCol(c)
+          .setOutputCol(s"${c}_index")
+      ).toArray
+
+      // Encoding previously indexed columns
+      val encoder: Array[org.apache.spark.ml.PipelineStage] = CategoricalColumns.map(
         c => new OneHotEncoder()
-         .setInputCol(s"${c}_index")
-         .setOutputCol(s"${c}_vec")
-    ).toArray
+          .setInputCol(s"${c}_index")
+          .setOutputCol(s"${c}_vec")
+      ).toArray
 
-    // Creation of list of columns for vector assembler (with only numerical columns)
-    val assemblerColumns = (Set(dataDF.columns: _*) -- categoricalColumns ++ categoricalColumns.map(c => s"${c}_vec")).toArray
+      // Creation of list of columns for vector assembler (with only numerical columns)
+      val assemblerColumns = (Set(dataDF.columns: _*) -- CategoricalColumns ++ CategoricalColumns.map(c => s"${c}_vec")).toArray
 
-    // Creation of vector with features
-    val assembler = new VectorAssembler()
-      .setInputCols(assemblerColumns)
-      .setOutputCol("featuresVector")
+      // Creation of vector with features
+      val assembler = new VectorAssembler()
+        .setInputCols(assemblerColumns)
+        .setOutputCol("features")
 
-    // Normalization using standard deviation
-    val scaler = new StandardScaler()
-      .setInputCol("featuresVector")
-      .setOutputCol("scaledFeatureVector")
-      .setWithStd(true)
-      .setWithMean(false)
+      val kmeans = new KMeans()
+        .setK(k)
+        .setFeaturesCol("features")
+        .setPredictionCol("prediction")
+        .setSeed(1L)
 
-    val kmeans = new KMeans()
-      .setK(K)
-      .setFeaturesCol("scaledFeatureVector")
-      .setPredictionCol("prediction")
-      .setSeed(1L)
+      val pipeline = new Pipeline()
+        .setStages(indexer ++ encoder ++ Array(assembler, kmeans))
 
-    val pipeline = new Pipeline()
-      .setStages(indexer ++ encoder ++ Array(assembler, scaler, kmeans))
+      val pipelineModel = pipeline.fit(dataDF)
+      dataDF.unpersist()
 
-    val pipelineModel = pipeline.fit(dataDF)
+      this.kmeansComputeCost(pipelineModel, "K-means (" + k + ") with one-hot encoder")
+    }
 
-    val kmeansModel = pipelineModel.stages.last.asInstanceOf[KMeansModel]
-    val WSSSE = kmeansModel.computeCost(pipelineModel.transform(dataDF))
-    println(s"Within Set Sum of Squared Errors = $WSSSE")
+    def kmeansOneHotEncoderWithNormalization(k: Int): Unit = {
+      println(s"Running kmeansOneHotEncoderWithNormalization ($k)")
+      // Remove the label column
+      val dataDF = this.data.drop("label")
+      dataDF.cache()
 
-    // Shows the result.
-    println("Cluster Centers: ")
-    kmeansModel.clusterCenters.foreach(println)
+      // Indexing categorical columns
+      val indexer: Array[org.apache.spark.ml.PipelineStage] = CategoricalColumns.map(
+        c => new StringIndexer()
+          .setInputCol(c)
+          .setOutputCol(s"${c}_index")
+      ).toArray
+
+      // Encoding previously indexed columns
+      val encoder: Array[org.apache.spark.ml.PipelineStage] = CategoricalColumns.map(
+        c => new OneHotEncoder()
+          .setInputCol(s"${c}_index")
+          .setOutputCol(s"${c}_vec")
+      ).toArray
+
+      // Creation of list of columns for vector assembler (with only numerical columns)
+      val assemblerColumns = (Set(dataDF.columns: _*) -- CategoricalColumns ++ CategoricalColumns.map(c => s"${c}_vec")).toArray
+
+      // Creation of vector with features
+      val assembler = new VectorAssembler()
+        .setInputCols(assemblerColumns)
+        .setOutputCol("featuresVector")
+
+      // Normalization using standard deviation
+      val scaler = new StandardScaler()
+        .setInputCol("featuresVector")
+        .setOutputCol("features")
+        .setWithStd(true)
+        .setWithMean(false)
+
+      val kmeans = new KMeans()
+        .setK(k)
+        .setFeaturesCol("features")
+        .setPredictionCol("prediction")
+        .setSeed(1L)
+
+      val pipeline = new Pipeline()
+        .setStages(indexer ++ encoder ++ Array(assembler, scaler, kmeans))
+
+      val pipelineModel = pipeline.fit(dataDF)
+      dataDF.unpersist()
+
+      this.kmeansComputeCost(pipelineModel, "K-means (" + k + ") with one-hot encoder with normalization")
+    }
+
+    private def kmeansComputeCost(pipelineModel: PipelineModel, technique: String): Unit = {
+      val kmeansModel = pipelineModel.stages.last.asInstanceOf[KMeansModel]
+      val WSSSE = kmeansModel.computeCost(pipelineModel.transform(data))
+      println(s"Results for $technique")
+      println(s"Within Set Sum of Squared Errors = $WSSSE")
+
+      // Shows the result.
+      println("Cluster Centers: ")
+      kmeansModel.clusterCenters.foreach(println)
+
+      // Writes result to file
+      val format = new SimpleDateFormat("yyyyMMddhhmm")
+      val pw = new PrintWriter(new File("results" + format.format(Calendar.getInstance().getTime) +
+        "_" + technique.replaceAll(" ", "_") + ".txt"))
+      try {
+        println(technique)
+        pw.write(s"$technique\n")
+
+        println(s"Within Set Sum of Squared Errors = $WSSSE")
+        pw.write(s"Within Set Sum of Squared Errors = $WSSSE\n")
+
+        kmeansModel.clusterCenters.foreach(cluster => {
+          println(cluster.toString)
+          pw.write(cluster.toString + "\n")
+        })
+      } finally {
+        pw.close()
+      }
+    }
+
+    def bisectingKmeansOneHotEncoderWithNormalization(k: Int): Unit = {
+      println(s"Running bisectingKmeansOneHotEncoderWithNormalization ($k)")
+      // Remove the label column
+      val dataDF = this.data.drop("label")
+      dataDF.cache()
+
+      // Indexing categorical columns
+      val indexer: Array[org.apache.spark.ml.PipelineStage] = CategoricalColumns.map(
+        c => new StringIndexer()
+          .setInputCol(c)
+          .setOutputCol(s"${c}_index")
+      ).toArray
+
+      // Encoding previously indexed columns
+      val encoder: Array[org.apache.spark.ml.PipelineStage] = CategoricalColumns.map(
+        c => new OneHotEncoder()
+          .setInputCol(s"${c}_index")
+          .setOutputCol(s"${c}_vec")
+      ).toArray
+
+      // Creation of list of columns for vector assembler (with only numerical columns)
+      val assemblerColumns = (Set(dataDF.columns: _*) -- CategoricalColumns ++ CategoricalColumns.map(c => s"${c}_vec")).toArray
+
+      // Creation of vector with features
+      val assembler = new VectorAssembler()
+        .setInputCols(assemblerColumns)
+        .setOutputCol("featuresVector")
+
+      // Normalization using standard deviation
+      val scaler = new StandardScaler()
+        .setInputCol("featuresVector")
+        .setOutputCol("features")
+        .setWithStd(true)
+        .setWithMean(false)
+
+      val kmeans = new BisectingKMeans()
+        .setK(k)
+        .setFeaturesCol("features")
+        .setPredictionCol("prediction")
+        .setSeed(1L)
+
+      val pipeline = new Pipeline()
+        .setStages(indexer ++ encoder ++ Array(assembler, scaler, kmeans))
+
+      val pipelineModel = pipeline.fit(dataDF)
+      dataDF.unpersist()
+
+      val kmeansModel = pipelineModel.stages.last.asInstanceOf[BisectingKMeansModel]
+      val WSSSE = kmeansModel.computeCost(pipelineModel.transform(data))
+      val technique = "Bisecting K-means (" + k + ") with one-hot encoder with normalization"
+
+      // Writes result to file and to stdout
+      val format = new SimpleDateFormat("yyyyMMddhhmm")
+      val pw = new PrintWriter(new File("results" + format.format(Calendar.getInstance().getTime) +
+        "_" + technique.replaceAll(" ", "_") + ".txt"))
+      try {
+        println(technique)
+        pw.write(s"$technique\n")
+
+        println(s"Within Set Sum of Squared Errors = $WSSSE")
+        pw.write(s"Within Set Sum of Squared Errors = $WSSSE\n")
+
+        kmeansModel.clusterCenters.foreach(cluster => {
+          println(cluster.toString)
+          pw.write(cluster.toString + "\n")
+        })
+      } finally {
+        pw.close()
+      }
+    }
+
+    def gaussianMixtureOneHotEncoderWithNormalization(k: Int): Unit = {
+      println(s"Running gaussianMixtureOneHotEncoderWithNormalization ($k)")
+      // Remove the label column
+      val dataDF = this.data.drop("label")
+      dataDF.cache()
+
+      // Indexing categorical columns
+      val indexer: Array[org.apache.spark.ml.PipelineStage] = CategoricalColumns.map(
+        c => new StringIndexer()
+          .setInputCol(c)
+          .setOutputCol(s"${c}_index")
+      ).toArray
+
+      // Encoding previously indexed columns
+      val encoder: Array[org.apache.spark.ml.PipelineStage] = CategoricalColumns.map(
+        c => new OneHotEncoder()
+          .setInputCol(s"${c}_index")
+          .setOutputCol(s"${c}_vec")
+      ).toArray
+
+      // Creation of list of columns for vector assembler (with only numerical columns)
+      val assemblerColumns = (Set(dataDF.columns: _*) -- CategoricalColumns ++ CategoricalColumns.map(c => s"${c}_vec")).toArray
+
+      // Creation of vector with features
+      val assembler = new VectorAssembler()
+        .setInputCols(assemblerColumns)
+        .setOutputCol("featuresVector")
+
+      // Normalization using standard deviation
+      val scaler = new StandardScaler()
+        .setInputCol("featuresVector")
+        .setOutputCol("features")
+        .setWithStd(true)
+        .setWithMean(false)
+
+      val gaussianMixture = new GaussianMixture()
+        .setK(k)
+        .setFeaturesCol("features")
+        .setPredictionCol("prediction")
+        .setSeed(1L)
+
+      val pipeline = new Pipeline()
+        .setStages(indexer ++ encoder ++ Array(assembler, scaler, gaussianMixture))
+
+      val pipelineModel = pipeline.fit(dataDF)
+      dataDF.unpersist()
+
+      val gmm = pipelineModel.stages.last.asInstanceOf[GaussianMixtureModel]
+      //val WSSSE = gaussianMixtureModel.(pipelineModel.transform(data))
+      val technique = "GaussianMixture (" + k + ") with one-hot encoder with normalization"
+      println(s"Results for $technique")
+
+      // Writes result to file and to stdout
+      val format = new SimpleDateFormat("yyyyMMddhhmm")
+      val pw = new PrintWriter(new File("results" + format.format(Calendar.getInstance().getTime) +
+        "_" + technique.replaceAll(" ", "_") + ".txt"))
+      try {
+        println(technique)
+        pw.write(s"$technique\n")
+
+        // Output parameters of max-likelihood model
+        for (i <- 0 until gmm.getK) {
+          val res = s"Gaussian $i:\nweight=${gmm.weights(i)}\n" +
+            s"mu=${gmm.gaussians(i).mean}\nsigma=\n${gmm.gaussians(i).cov}\n"
+          println(res)
+          pw.write(s"$res\n")
+        }
+      } finally {
+        pw.close()
+      }
+    }
   }
 }
