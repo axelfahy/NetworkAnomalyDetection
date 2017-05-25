@@ -36,12 +36,13 @@ import java.io.{File, PrintWriter}
 import java.text.SimpleDateFormat
 import java.util.Calendar
 
-import org.apache.spark.ml.{Pipeline, PipelineModel}
+import org.apache.spark.ml.{Pipeline}
 import org.apache.spark.{SparkConf, SparkContext}
-import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.apache.spark.sql.types._
 import org.apache.spark.ml.clustering._
 import org.apache.spark.ml.feature.{OneHotEncoder, StandardScaler, StringIndexer, VectorAssembler}
+import org.apache.spark.ml.linalg.{DenseVector, Vector}
 
 
 object NetworkAnomalyDetection {
@@ -117,21 +118,77 @@ object NetworkAnomalyDetection {
     val runClustering = new RunClustering(spark, rawDataDF)
 
     // K-means
-    (20 to 100 by 20).map(k => (k, runClustering.kmeansSimple(k)))
-    (20 to 100 by 20).map(k => (k, runClustering.kmeansOneHotEncoder(k)))
-    (20 to 100 by 20).map(k => (k, runClustering.kmeansOneHotEncoderWithNormalization(k)))
+    //(20 to 100 by 20).map(k => (k, runClustering.kmeansSimple(k)))
+    //(20 to 100 by 20).map(k => (k, runClustering.kmeansOneHotEncoder(k)))
+    //(20 to 100 by 20).map(k => (k, runClustering.kmeansOneHotEncoderWithNormalization(k)))
+    //runClustering.gaussianMixtureOneHotEncoderWithNormalization(20)
+    runClustering.kmeansOneHotEncoderWithNormalization(20)
 
-    // Bisecting K-means
-    (20 to 100 by 20).map(k => (k, runClustering.bisectingKmeansOneHotEncoderWithNormalization(k)))
+    //// Bisecting K-means
+    //(20 to 100 by 20).map(k => (k, runClustering.bisectingKmeansOneHotEncoderWithNormalization(k)))
 
     // Gaussian Mixture
-    (20 to 100 by 20).map(k => (k, runClustering.gaussianMixtureOneHotEncoderWithNormalization(k)))
+    //(20 to 100 by 20).map(k => (k, runClustering.gaussianMixtureOneHotEncoderWithNormalization(k)))
+    //runClustering.gaussianMixtureOneHotEncoderWithNormalization(20)
   }
 
   class RunClustering(private val spark: SparkSession, var data: DataFrame) {
 
+    import spark.implicits._
+
     // Select only numerical features
     val CategoricalColumns = Seq("protocol_type", "service", "flag")
+
+    def distance(centroid: Vector, data: Vector) =
+      // Tranforming vector to array of double since operations
+      // on vector are not implemented
+      math.sqrt(centroid.toArray.zip(data.toArray)
+        .map(p => p._1 - p._2).map(d => d * d).sum)
+
+    def distanceAllCluster(centroid: Vector, dataCentroid: Array[DenseVector]) = {
+      dataCentroid.map(d => distance(centroid, d))
+    }
+
+    def clusteringScore(centroids: Array[Vector], data: DataFrame, k: Int) = {
+      // For each k, select data belonging to the centroid
+      // and calculating the distance.
+      val score = (0 until k).map{ k =>
+        val dataCentroid = data.filter($"prediction" === k)
+          .select("features")
+          .collect()
+          .map {
+            // Get the feature vectors in dense format
+            case Row(v: Vector) => v.toDense
+          }
+        val s = distanceAllCluster(centroids(k), dataCentroid)
+        if (s.length > 0)
+          s.sum / s.length
+        else
+          s.sum
+      }
+      if (score.nonEmpty)
+        score.sum / score.length
+      else
+        score.sum
+    }
+
+    def write2file(score: Double, startTime: Long, technique: String) = {
+      // Writes result to file
+      val format = new SimpleDateFormat("yyyyMMddHHmm")
+      val pw = new PrintWriter(new File("results" + format.format(Calendar.getInstance().getTime) +
+        "_" + technique.replaceAll(" ", "_") + ".txt"))
+      try {
+        println(technique)
+        pw.write(s"$technique\n")
+        println(s"Score=$score")
+        pw.write(s"Score=$score\n")
+        val duration = (System.nanoTime - startTime) / 1e9d
+        println(s"Duration=$duration")
+        pw.write(s"Duration=$duration\n")
+      } finally {
+        pw.close()
+      }
+    }
 
     def kmeansSimple(k: Int): Unit = {
       println(s"Running kmeansSimple ($k)")
@@ -155,16 +212,30 @@ object NetworkAnomalyDetection {
       val pipeline = new Pipeline()
         .setStages(Array(assembler, kmeans))
 
-      val pipelineModel = pipeline.fit(dataDF)
+      val dataDFSample = dataDF.sample(false, 0.01, 42)
+      dataDFSample.cache()
+      val pipelineModel = pipeline.fit(dataDFSample)
       dataDF.unpersist()
+      //val pipelineModel = pipeline.fit(dataDF)
+      //dataDF.unpersist()
 
-      this.kmeansComputeCost(pipelineModel, "K-means (" + k + ") simple")
-      val duration = (System.nanoTime - startTime) / 1e9d
-      println(s"Duration: $duration")
+      val kmeansModel = pipelineModel.stages.last.asInstanceOf[KMeansModel]
+
+      // Prediction
+      val cluster = pipelineModel.transform(dataDFSample)
+
+      // Get the centroids
+      val centroids = kmeansModel.clusterCenters
+
+      // Calculate the score
+      val score = this.clusteringScore(centroids, cluster, k)
+
+      this.write2file(score, startTime, "K-means (" + k + ") simple")
     }
 
     def kmeansOneHotEncoder(k: Int): Unit = {
       println(s"Running kmeansOneHotEncoder ($k)")
+      val startTime = System.nanoTime()
       // Remove the label column
       val dataDF = this.data.drop("label")
       dataDF.cache()
@@ -203,11 +274,23 @@ object NetworkAnomalyDetection {
       val pipelineModel = pipeline.fit(dataDF)
       dataDF.unpersist()
 
-      this.kmeansComputeCost(pipelineModel, "K-means (" + k + ") with one-hot encoder")
+      val kmeansModel = pipelineModel.stages.last.asInstanceOf[KMeansModel]
+
+      // Prediction
+      val cluster = pipelineModel.transform(dataDF)
+
+      // Get the centroids
+      val centroids = kmeansModel.clusterCenters
+
+      // Calculate the score
+      val score = this.clusteringScore(centroids, cluster, k)
+
+      this.write2file(score, startTime, "K-means (" + k + ") with one-hot encoder")
     }
 
     def kmeansOneHotEncoderWithNormalization(k: Int): Unit = {
       println(s"Running kmeansOneHotEncoderWithNormalization ($k)")
+      val startTime = System.nanoTime()
       // Remove the label column
       val dataDF = this.data.drop("label")
       dataDF.cache()
@@ -250,44 +333,30 @@ object NetworkAnomalyDetection {
       val pipeline = new Pipeline()
         .setStages(indexer ++ encoder ++ Array(assembler, scaler, kmeans))
 
-      val pipelineModel = pipeline.fit(dataDF)
+      val dataDFSample = dataDF.sample(false, 0.01, 42)
+      dataDFSample.cache()
+      val pipelineModel = pipeline.fit(dataDFSample)
       dataDF.unpersist()
+      //val pipelineModel = pipeline.fit(dataDF)
+      //dataDF.unpersist()
 
-      this.kmeansComputeCost(pipelineModel, "K-means (" + k + ") with one-hot encoder with normalization")
-    }
+      // Prediction
+      val cluster = pipelineModel.transform(dataDF)
 
-    private def kmeansComputeCost(pipelineModel: PipelineModel, technique: String): Unit = {
       val kmeansModel = pipelineModel.stages.last.asInstanceOf[KMeansModel]
-      val WSSSE = kmeansModel.computeCost(pipelineModel.transform(data))
-      println(s"Results for $technique")
-      println(s"Within Set Sum of Squared Errors = $WSSSE")
 
-      // Shows the result.
-      println("Cluster Centers: ")
-      kmeansModel.clusterCenters.foreach(println)
+      // Get the centroids
+      val centroids = kmeansModel.clusterCenters
 
-      // Writes result to file
-      val format = new SimpleDateFormat("yyyyMMddhhmm")
-      val pw = new PrintWriter(new File("results" + format.format(Calendar.getInstance().getTime) +
-        "_" + technique.replaceAll(" ", "_") + ".txt"))
-      try {
-        println(technique)
-        pw.write(s"$technique\n")
+      // Calculate the score
+      val score = this.clusteringScore(centroids, cluster, k)
 
-        println(s"Within Set Sum of Squared Errors = $WSSSE")
-        pw.write(s"Within Set Sum of Squared Errors = $WSSSE\n")
-
-        kmeansModel.clusterCenters.foreach(cluster => {
-          println(cluster.toString)
-          pw.write(cluster.toString + "\n")
-        })
-      } finally {
-        pw.close()
-      }
+      this.write2file(score, startTime, "K-means (" + k + ") with one-hot encoder with normalization")
     }
 
     def bisectingKmeansOneHotEncoderWithNormalization(k: Int): Unit = {
       println(s"Running bisectingKmeansOneHotEncoderWithNormalization ($k)")
+      val startTime = System.nanoTime()
       // Remove the label column
       val dataDF = this.data.drop("label")
       dataDF.cache()
@@ -333,32 +402,23 @@ object NetworkAnomalyDetection {
       val pipelineModel = pipeline.fit(dataDF)
       dataDF.unpersist()
 
+      // Prediction
+      val cluster = pipelineModel.transform(dataDF)
+
       val kmeansModel = pipelineModel.stages.last.asInstanceOf[BisectingKMeansModel]
-      val WSSSE = kmeansModel.computeCost(pipelineModel.transform(data))
-      val technique = "Bisecting K-means (" + k + ") with one-hot encoder with normalization"
 
-      // Writes result to file and to stdout
-      val format = new SimpleDateFormat("yyyyMMddhhmm")
-      val pw = new PrintWriter(new File("results" + format.format(Calendar.getInstance().getTime) +
-        "_" + technique.replaceAll(" ", "_") + ".txt"))
-      try {
-        println(technique)
-        pw.write(s"$technique\n")
+      // Get the centroids
+      val centroids = kmeansModel.clusterCenters
 
-        println(s"Within Set Sum of Squared Errors = $WSSSE")
-        pw.write(s"Within Set Sum of Squared Errors = $WSSSE\n")
+      // Calculate the score
+      val score = this.clusteringScore(centroids, cluster, k)
 
-        kmeansModel.clusterCenters.foreach(cluster => {
-          println(cluster.toString)
-          pw.write(cluster.toString + "\n")
-        })
-      } finally {
-        pw.close()
-      }
+      this.write2file(score, startTime, "Bisecting K-means (" + k + ") with one-hot encoder with normalization")
     }
 
     def gaussianMixtureOneHotEncoderWithNormalization(k: Int): Unit = {
       println(s"Running gaussianMixtureOneHotEncoderWithNormalization ($k)")
+      val startTime = System.nanoTime()
       // Remove the label column
       val dataDF = this.data.drop("label")
       dataDF.cache()
@@ -401,32 +461,23 @@ object NetworkAnomalyDetection {
       val pipeline = new Pipeline()
         .setStages(indexer ++ encoder ++ Array(assembler, scaler, gaussianMixture))
 
-      val pipelineModel = pipeline.fit(dataDF)
+      val dataDFSample = dataDF.sample(false, 0.01, 42)
+      dataDFSample.cache()
+      val pipelineModel = pipeline.fit(dataDFSample)
       dataDF.unpersist()
 
       val gmm = pipelineModel.stages.last.asInstanceOf[GaussianMixtureModel]
-      //val WSSSE = gaussianMixtureModel.(pipelineModel.transform(data))
-      val technique = "GaussianMixture (" + k + ") with one-hot encoder with normalization"
-      println(s"Results for $technique")
 
-      // Writes result to file and to stdout
-      val format = new SimpleDateFormat("yyyyMMddhhmm")
-      val pw = new PrintWriter(new File("results" + format.format(Calendar.getInstance().getTime) +
-        "_" + technique.replaceAll(" ", "_") + ".txt"))
-      try {
-        println(technique)
-        pw.write(s"$technique\n")
+      // Prediction
+      val cluster = pipelineModel.transform(dataDFSample)
 
-        // Output parameters of max-likelihood model
-        for (i <- 0 until gmm.getK) {
-          val res = s"Gaussian $i:\nweight=${gmm.weights(i)}\n" +
-            s"mu=${gmm.gaussians(i).mean}\nsigma=\n${gmm.gaussians(i).cov}\n"
-          println(res)
-          pw.write(s"$res\n")
-        }
-      } finally {
-        pw.close()
-      }
+      // Get the centroids
+      val centroids = (0 until k).map(i => gmm.gaussians(i).mean).toArray
+
+      // Calculate the score
+      val score = this.clusteringScore(centroids, cluster, k)
+
+      this.write2file(score, startTime, "GaussianMixture (" + k + ") with one-hot encoder with normalization")
     }
   }
 }
