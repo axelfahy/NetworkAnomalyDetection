@@ -1,13 +1,12 @@
 /**
  * Anomaly Detection in Network Traffic with different clustering algorithm.
  *
- * The implementation is done using the Dataframe-based API of SparkMLlib.
+ * The implementation is done using the DataFrame-based API of SparkMLlib.
  *
  * Algorithms:
  *
  *  - K-means
  *  - Gaussian Mixture Model (GMM)
- *  - Latent Dirichlet allocation (LDA)
  *
  * Categorical features are transformed into numerical features using one-hot encoder.
  * Afterwards, all features are normalized.
@@ -16,19 +15,22 @@
  *
  * Metrics used:
  *
- *  - K-means: Within Set Sum of Squared Errors (WSSSE)
- *  - GMM: Mean, covariance and weights
+ *  - Sum of distances between points and their centroids
+ *
+ * GMM is really slow (quadratic algorithm), so the performance will only be done on 1% of the dataset.
  *
  * Basic implementation is based on the chapter 5 (Anomaly Detection in Network Traffic with K-means clustering)
  * of the book Advanced Analytics with Spark.
- * However, this implementation is using the Dataframe-based API instead of the RDD-based API.
+ * However, this implementation is using the DataFrame-based API instead of the RDD-based API.
+ *
+ * Datasource: https://archive.ics.uci.edu/ml/datasets/KDD+Cup+1999+Data
  *
  * @author Axel Fahy
  * @author Rudolf Höhn
  * @author Brian Nydegger
  * @author Assaf Mahmoud
  *
- * @date 18.05.2017
+ * @date 26.05.2017
  *
  */
 
@@ -36,7 +38,7 @@ import java.io.{File, PrintWriter}
 import java.text.SimpleDateFormat
 import java.util.Calendar
 
-import org.apache.spark.ml.{Pipeline}
+import org.apache.spark.ml.Pipeline
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.apache.spark.sql.types._
@@ -48,6 +50,9 @@ import org.apache.spark.ml.linalg.{DenseVector, Vector}
 object NetworkAnomalyDetection {
 
   val DataPath = "data/kddcup.data.corrected"
+
+  // Fraction of the dataset used (1.0 for the full dataset)
+  val Fraction = 0.01
 
   // Schema of data from csv file
   // Used when loading the data to have a correct structure
@@ -109,27 +114,27 @@ object NetworkAnomalyDetection {
       .appName("NetworkAnomalyDetection")
       .getOrCreate()
 
+    // Load the data into the schema created previously
     val rawDataDF = spark.read.format("com.databricks.spark.csv")
       .option("header", "false")
       .option("inferSchema", "true")
       .schema(DataSchema)
       .load(DataPath)
 
-    val runClustering = new RunClustering(spark, rawDataDF)
+    val dataDF = rawDataDF.sample(false, Fraction, 42)
+    println("Size of dataset=" + dataDF.count + " (total=" + rawDataDF.count + ")")
+    val runClustering = new RunClustering(spark, dataDF)
 
     // K-means
-    //(20 to 100 by 20).map(k => (k, runClustering.kmeansSimple(k)))
-    //(20 to 100 by 20).map(k => (k, runClustering.kmeansOneHotEncoder(k)))
-    //(20 to 100 by 20).map(k => (k, runClustering.kmeansOneHotEncoderWithNormalization(k)))
-    //runClustering.gaussianMixtureOneHotEncoderWithNormalization(20)
-    runClustering.kmeansOneHotEncoderWithNormalization(20)
+    (20 to 100 by 10).map(k => (k, runClustering.kmeansSimple(k)))
+    (20 to 100 by 10).map(k => (k, runClustering.kmeansOneHotEncoder(k)))
+    (20 to 100 by 10).map(k => (k, runClustering.kmeansOneHotEncoderWithNormalization(k)))
 
-    //// Bisecting K-means
-    //(20 to 100 by 20).map(k => (k, runClustering.bisectingKmeansOneHotEncoderWithNormalization(k)))
+    // Bisecting K-means
+    (20 to 100 by 10).map(k => (k, runClustering.bisectingKmeansOneHotEncoderWithNormalization(k)))
 
     // Gaussian Mixture
-    //(20 to 100 by 20).map(k => (k, runClustering.gaussianMixtureOneHotEncoderWithNormalization(k)))
-    //runClustering.gaussianMixtureOneHotEncoderWithNormalization(20)
+    (20 to 100 by 10).map(k => (k, runClustering.gaussianMixtureOneHotEncoderWithNormalization(k)))
   }
 
   class RunClustering(private val spark: SparkSession, var data: DataFrame) {
@@ -139,19 +144,42 @@ object NetworkAnomalyDetection {
     // Select only numerical features
     val CategoricalColumns = Seq("protocol_type", "service", "flag")
 
-    def distance(centroid: Vector, data: Vector) =
+    /**
+      * Calculate the Euclidean distance between a data point and its centroid
+      *
+      * @param centroid Vector with the components of the centroid
+      * @param data Vector with the components of the data point
+      * @return The distance between the data point and the centroid
+      */
+    def distance(centroid: Vector, data: Vector): Double =
       // Tranforming vector to array of double since operations
       // on vector are not implemented
       math.sqrt(centroid.toArray.zip(data.toArray)
         .map(p => p._1 - p._2).map(d => d * d).sum)
 
-    def distanceAllCluster(centroid: Vector, dataCentroid: Array[DenseVector]) = {
+    /**
+      * Apply the Euclidean distance between all points belonging to a centroid and the centroid in question
+      *
+      * @param centroid Vector with the components of the centroid
+      * @param dataCentroid All data points (as Vector) belonging to the centroid
+      * @return An array of double containing all the distance of a cluster (data with same centroid)
+      */
+    def distanceAllCluster(centroid: Vector, dataCentroid: Array[DenseVector]): Array[Double] = {
       dataCentroid.map(d => distance(centroid, d))
     }
 
-    def clusteringScore(centroids: Array[Vector], data: DataFrame, k: Int) = {
-      // For each k, select data belonging to the centroid
-      // and calculating the distance.
+    /**
+      * Calculate the score of a cluster
+      *
+      * For each k, select data belonging to the centroid
+      * and calculating the distance.
+      *
+      * @param centroids Array containing all the centroids
+      * @param data Dataset used
+      * @param k Number of cluster
+      * @return The mean of the score from all cluster
+      */
+    def clusteringScore(centroids: Array[Vector], data: DataFrame, k: Int): Double = {
       val score = (0 until k).map{ k =>
         val dataCentroid = data.filter($"prediction" === k)
           .select("features")
@@ -160,11 +188,7 @@ object NetworkAnomalyDetection {
             // Get the feature vectors in dense format
             case Row(v: Vector) => v.toDense
           }
-        val s = distanceAllCluster(centroids(k), dataCentroid)
-        if (s.length > 0)
-          s.sum / s.length
-        else
-          s.sum
+        distanceAllCluster(centroids(k), dataCentroid).sum
       }
       if (score.nonEmpty)
         score.sum / score.length
@@ -172,8 +196,16 @@ object NetworkAnomalyDetection {
         score.sum
     }
 
-    def write2file(score: Double, startTime: Long, technique: String) = {
-      // Writes result to file
+    /**
+      * Write the result of a run into a file
+      *
+      * Filename is create dynamically with the current date and the algorithm used.
+      *
+      * @param score Score already calculated
+      * @param startTime Start time of the computation
+      * @param technique String with the name of the algorithm/preprocessing used
+      */
+    def write2file(score: Double, startTime: Long, technique: String): Unit = {
       val format = new SimpleDateFormat("yyyyMMddHHmm")
       val pw = new PrintWriter(new File("results" + format.format(Calendar.getInstance().getTime) +
         "_" + technique.replaceAll(" ", "_") + ".txt"))
@@ -190,6 +222,11 @@ object NetworkAnomalyDetection {
       }
     }
 
+    /**
+      * K-means with only numerical features, without normalization
+      *
+      * @param k Number of cluster
+      */
     def kmeansSimple(k: Int): Unit = {
       println(s"Running kmeansSimple ($k)")
       val startTime = System.nanoTime()
@@ -212,17 +249,13 @@ object NetworkAnomalyDetection {
       val pipeline = new Pipeline()
         .setStages(Array(assembler, kmeans))
 
-      val dataDFSample = dataDF.sample(false, 0.01, 42)
-      dataDFSample.cache()
-      val pipelineModel = pipeline.fit(dataDFSample)
-      dataDF.unpersist()
-      //val pipelineModel = pipeline.fit(dataDF)
-      //dataDF.unpersist()
+      val pipelineModel = pipeline.fit(dataDF)
 
       val kmeansModel = pipelineModel.stages.last.asInstanceOf[KMeansModel]
 
       // Prediction
-      val cluster = pipelineModel.transform(dataDFSample)
+      val cluster = pipelineModel.transform(dataDF)
+      dataDF.unpersist()
 
       // Get the centroids
       val centroids = kmeansModel.clusterCenters
@@ -233,6 +266,13 @@ object NetworkAnomalyDetection {
       this.write2file(score, startTime, "K-means (" + k + ") simple")
     }
 
+    /**
+      * K-means using categorical features, without normalization
+      *
+      * Categorical features are encoded using the One-Hot encoder.
+      *
+      * @param k Number of cluster
+      */
     def kmeansOneHotEncoder(k: Int): Unit = {
       println(s"Running kmeansOneHotEncoder ($k)")
       val startTime = System.nanoTime()
@@ -272,12 +312,12 @@ object NetworkAnomalyDetection {
         .setStages(indexer ++ encoder ++ Array(assembler, kmeans))
 
       val pipelineModel = pipeline.fit(dataDF)
-      dataDF.unpersist()
 
       val kmeansModel = pipelineModel.stages.last.asInstanceOf[KMeansModel]
 
       // Prediction
       val cluster = pipelineModel.transform(dataDF)
+      dataDF.unpersist()
 
       // Get the centroids
       val centroids = kmeansModel.clusterCenters
@@ -288,6 +328,15 @@ object NetworkAnomalyDetection {
       this.write2file(score, startTime, "K-means (" + k + ") with one-hot encoder")
     }
 
+    /**
+      * K-means using categorical features, with normalization
+      *
+      * Categorical features are encoded using the One-hot encoder.
+      * One-hot encoder will map a column of label indices to a column of binary vectors.
+      * Normalization is done using the standard deviation
+      *
+      * @param k Number of cluster
+      */
     def kmeansOneHotEncoderWithNormalization(k: Int): Unit = {
       println(s"Running kmeansOneHotEncoderWithNormalization ($k)")
       val startTime = System.nanoTime()
@@ -333,15 +382,11 @@ object NetworkAnomalyDetection {
       val pipeline = new Pipeline()
         .setStages(indexer ++ encoder ++ Array(assembler, scaler, kmeans))
 
-      val dataDFSample = dataDF.sample(false, 0.01, 42)
-      dataDFSample.cache()
-      val pipelineModel = pipeline.fit(dataDFSample)
-      dataDF.unpersist()
-      //val pipelineModel = pipeline.fit(dataDF)
-      //dataDF.unpersist()
+      val pipelineModel = pipeline.fit(dataDF)
 
       // Prediction
       val cluster = pipelineModel.transform(dataDF)
+      dataDF.unpersist()
 
       val kmeansModel = pipelineModel.stages.last.asInstanceOf[KMeansModel]
 
@@ -354,6 +399,18 @@ object NetworkAnomalyDetection {
       this.write2file(score, startTime, "K-means (" + k + ") with one-hot encoder with normalization")
     }
 
+    /**
+      * Bisecting K-means using categorical features, with normalization
+      *
+      * With the Bisecting K-means, al observations start in one cluster
+      * and split are performed recursively in a "top-down" approach.
+      *
+      * Categorical features are encoded using the One-hot encoder.
+      * One-hot encoder will map a column of label indices to a column of binary vectors.
+      * Normalization is done using the standard deviation
+      *
+      * @param k Number of cluster
+      */
     def bisectingKmeansOneHotEncoderWithNormalization(k: Int): Unit = {
       println(s"Running bisectingKmeansOneHotEncoderWithNormalization ($k)")
       val startTime = System.nanoTime()
@@ -400,10 +457,10 @@ object NetworkAnomalyDetection {
         .setStages(indexer ++ encoder ++ Array(assembler, scaler, kmeans))
 
       val pipelineModel = pipeline.fit(dataDF)
-      dataDF.unpersist()
 
       // Prediction
       val cluster = pipelineModel.transform(dataDF)
+      dataDF.unpersist()
 
       val kmeansModel = pipelineModel.stages.last.asInstanceOf[BisectingKMeansModel]
 
@@ -416,6 +473,18 @@ object NetworkAnomalyDetection {
       this.write2file(score, startTime, "Bisecting K-means (" + k + ") with one-hot encoder with normalization")
     }
 
+    /**
+      * Gaussian Mixture Model
+      *
+      * Categorical features are encoded using the One-hot encoder.
+      * One-hot encoder will map a column of label indices to a column of binary vectors.
+      * Normalization is done using the standard deviation
+      *
+      * GMM uses a quadratic algorithm and in consequence takes really long to perform.
+      * This algorithm will only be used on 1% of the dataset.
+      *
+      * @param k Number of cluster
+      */
     def gaussianMixtureOneHotEncoderWithNormalization(k: Int): Unit = {
       println(s"Running gaussianMixtureOneHotEncoderWithNormalization ($k)")
       val startTime = System.nanoTime()
@@ -461,15 +530,13 @@ object NetworkAnomalyDetection {
       val pipeline = new Pipeline()
         .setStages(indexer ++ encoder ++ Array(assembler, scaler, gaussianMixture))
 
-      val dataDFSample = dataDF.sample(false, 0.01, 42)
-      dataDFSample.cache()
-      val pipelineModel = pipeline.fit(dataDFSample)
-      dataDF.unpersist()
+      val pipelineModel = pipeline.fit(dataDF)
 
       val gmm = pipelineModel.stages.last.asInstanceOf[GaussianMixtureModel]
 
       // Prediction
-      val cluster = pipelineModel.transform(dataDFSample)
+      val cluster = pipelineModel.transform(dataDF)
+      dataDF.unpersist()
 
       // Get the centroids
       val centroids = (0 until k).map(i => gmm.gaussians(i).mean).toArray
