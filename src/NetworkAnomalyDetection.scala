@@ -188,7 +188,11 @@ object NetworkAnomalyDetection {
             // Get the feature vectors in dense format
             case Row(v: Vector) => v.toDense
           }
-        distanceAllCluster(centroids(k), dataCentroid).sum
+        val s = distanceAllCluster(centroids(k), dataCentroid)
+        if (s.length > 0)
+          s.sum / s.length
+        else
+          s.sum // Sum will be 0 if no element in cluster
       }
       if (score.nonEmpty)
         score.sum / score.length
