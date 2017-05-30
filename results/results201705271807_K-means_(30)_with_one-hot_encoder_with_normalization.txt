@@ -1,0 +1,3 @@
+K-means (30) with one-hot encoder with normalization
+Score=8.346482286155416
+Duration=708.824423426

@@ -1,0 +1,3 @@
+K-means (40) simple
+Score=918.3628605831424
+Duration=929.610309607

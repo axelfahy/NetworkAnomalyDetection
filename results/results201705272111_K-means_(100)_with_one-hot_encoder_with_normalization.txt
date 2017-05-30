@@ -1,0 +1,3 @@
+K-means (100) with one-hot encoder with normalization
+Score=3.581636032875701
+Duration=2243.538546857

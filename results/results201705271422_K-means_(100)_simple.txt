@@ -1,0 +1,3 @@
+K-means (100) simple
+Score=506.4350529644009
+Duration=2395.402772907

@@ -1,0 +1,3 @@
+Bisecting K-means (30) with one-hot encoder with normalization
+Score=14.904728795235828
+Duration=715.761176323
