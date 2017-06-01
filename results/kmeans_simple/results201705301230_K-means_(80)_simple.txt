@@ -1,0 +1,3 @@
+K-means (80) simple
+Score=44144.134731446975
+Duration=1436.104775358

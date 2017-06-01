@@ -1,0 +1,3 @@
+GaussianMixture (70) with one-hot encoder with normalization
+Score=3488.3761475423494
+Duration=7058.942404606

@@ -1,0 +1,3 @@
+K-means (90) with one-hot encoder
+Score=36740.76732934029
+Duration=1905.240331292
