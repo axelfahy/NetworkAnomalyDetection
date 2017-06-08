@@ -23,7 +23,14 @@
  * of the book Advanced Analytics with Spark.
  * However, this implementation is using the DataFrame-based API instead of the RDD-based API.
  *
+ * Anomaly detection is done as follow:
+ *
+ *   - Find the maximal value of each cluster, those will be the thresholds
+ *   - For a new point, calculate its score (distance), if it is more than the threshold of its cluster,
+ *     this is an anomaly
+ *
  * Datasource: https://archive.ics.uci.edu/ml/datasets/KDD+Cup+1999+Data
+ * Test set:  http://kdd.ics.uci.edu/databases/kddcup99/kddcup99.html (corrected.gz)
  *
  * @author Axel Fahy
  * @author Rudolf Höhn
@@ -38,21 +45,23 @@ import java.io.{File, PrintWriter}
 import java.text.SimpleDateFormat
 import java.util.Calendar
 
-import org.apache.spark.ml.Pipeline
+import org.apache.spark.ml.{Pipeline, PipelineModel}
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.apache.spark.sql.types._
 import org.apache.spark.ml.clustering._
 import org.apache.spark.ml.feature.{OneHotEncoder, StandardScaler, StringIndexer, VectorAssembler}
 import org.apache.spark.ml.linalg.{DenseVector, Vector}
+import org.apache.spark.sql.functions._
 
 
 object NetworkAnomalyDetection {
 
   val DataPath = "data/kddcup.data.corrected"
+  val TestPath = "data/test.data.corrected"
 
   // Fraction of the dataset used (1.0 for the full dataset)
-  val Fraction = 0.01
+  val Fraction = 1.0
 
   // Schema of data from csv file
   // Used when loading the data to have a correct structure
@@ -126,6 +135,7 @@ object NetworkAnomalyDetection {
     val runClustering = new RunClustering(spark, dataDF)
 
     // K-means
+    // K-means simple is also doing anomaly detections.
     (20 to 100 by 10).map(k => (k, runClustering.kmeansSimple(k)))
     (20 to 100 by 10).map(k => (k, runClustering.kmeansOneHotEncoder(k)))
     (20 to 100 by 10).map(k => (k, runClustering.kmeansOneHotEncoderWithNormalization(k)))
@@ -201,6 +211,114 @@ object NetworkAnomalyDetection {
     }
 
     /**
+      * Get the maximum value of each centroid
+      *
+      * @param centroids Array containing all the centroids
+      * @param data DataFrame containing the data points
+      * @param k The number of cluster
+      * @return A Map with k as the key and its maximum value as value
+      */
+    def maxByCentroid(centroids: Array[Vector], data: DataFrame, k: Int): Map[Int, Double] = {
+      val max = (0 until k).map{ k =>
+        val dataCentroid = data.filter($"prediction" === k)
+          .select("features")
+          .collect()
+          .map {
+            // Get the feature vectors in dense format
+            case Row(v: Vector) => v.toDense
+          }
+        val dist = distanceAllCluster(centroids(k), dataCentroid)
+        if (dist.isEmpty) {
+          (k, 0.0)
+        }
+        else
+          (k, dist.max)
+      }
+      max.toMap
+    }
+
+    /**
+      * Calculate the distance between a point and its centroid
+      *
+      * This is an udf and must be run on a DataFrame.
+      * Usage of currying in order to pass other parameters.
+      *
+      * The columns of the DataFrame to use: "features" and "prediction"
+      * Uses the prediction column to know in which centroid the point belongs.
+      *
+      * @param centroids Centroids
+      * @return
+      */
+    def calculateDistance(centroids: Array[Vector]) = udf((v: Vector, k: Int) => {
+      math.sqrt(centroids(k).toArray.zip(v.toArray)
+        .map(p => p._1 - p._2).map(d => d * d).sum)
+    })
+
+    /**
+      * Check if a point is an anomaly
+      *
+      * If the score of a point is higher than the maximum of the cluster
+      * in which it belongs, it is an anomaly.
+      *
+      * UDF run on "dist" column and "prediction"
+      *
+      * @param max Map containing the maximal value of each cluster
+      * @return 1 if the paquet is an anomaly, else 0
+      */
+    def checkAnomaly(max: Map[Int, Double]) = udf((distance: Double, k: Int) => if (distance > max(k)) 1 else 0)
+
+    /**
+      * Get all the anomalies of a test set
+      *
+      * @param pipeline The pipeline used for the preprocessing
+      * @param data The test data
+      * @param centroids The centroids found on the training data
+      * @param max Maximal value of each centroid
+      * @return A DataFrame containing the anomalies
+      */
+    def getAnomalies(pipeline: PipelineModel, data: DataFrame, centroids: Array[Vector], max: Map[Int, Double]) = {
+      val predictDF = pipeline.transform(data)
+
+      val distanceDF = predictDF.withColumn("dist", calculateDistance(centroids)(predictDF("features"), predictDF("prediction")))
+      val anomalies = distanceDF.withColumn("anomaly", checkAnomaly(max)(distanceDF("dist"), distanceDF("prediction")))
+      anomalies.filter($"anomaly" > 0)
+    }
+
+    /**
+      * Anomaly detection on test set
+      *
+      * Get the maximal value of each cluster, and check for each point
+      * if its value is higher than the maximal, if this is the case, this is an anomaly.
+      *
+      * @param dataDF Data of the training
+      * @param pipelineModel Pipeline model used with the training
+      * @param k Number of clusters
+      * @return A DataFrame containing the anomalies
+      */
+    def anomalyDectection(dataDF: DataFrame, pipelineModel: PipelineModel, k: Int): DataFrame = {
+      // Load the data into the schema created previously
+      val dataTestDF = spark.read.format("com.databricks.spark.csv")
+        .option("header", "false")
+        .option("inferSchema", "true")
+        .schema(DataSchema)
+        .load(TestPath)
+
+      // Prediction
+      val cluster = pipelineModel.transform(dataDF)
+
+      val kmeansModel = pipelineModel.stages.last.asInstanceOf[KMeansModel]
+
+      // Get the centroids
+      val centroids = kmeansModel.clusterCenters
+
+      // Get the maximal distance for each cluster (on the training data)
+      val max = this.maxByCentroid(centroids, cluster, k)
+
+      // Detect anomalies on the test data
+      getAnomalies(pipelineModel, dataTestDF, centroids, max)
+    }
+
+    /**
       * Write the result of a run into a file
       *
       * Filename is create dynamically with the current date and the algorithm used.
@@ -259,7 +377,6 @@ object NetworkAnomalyDetection {
 
       // Prediction
       val cluster = pipelineModel.transform(dataDF)
-      dataDF.unpersist()
 
       // Get the centroids
       val centroids = kmeansModel.clusterCenters
@@ -268,6 +385,12 @@ object NetworkAnomalyDetection {
       val score = this.clusteringScore(centroids, cluster, k)
 
       this.write2file(score, startTime, "K-means (" + k + ") simple")
+
+      // Anomaly detection
+      val anomalies = this.anomalyDectection(dataDF, pipelineModel, k)
+      println("Anomalies: " + anomalies.count())
+      anomalies.collect.foreach(println)
+      dataDF.unpersist()
     }
 
     /**
@@ -296,6 +419,7 @@ object NetworkAnomalyDetection {
         c => new OneHotEncoder()
           .setInputCol(s"${c}_index")
           .setOutputCol(s"${c}_vec")
+          .setDropLast(false)
       ).toArray
 
       // Creation of list of columns for vector assembler (with only numerical columns)
@@ -360,6 +484,7 @@ object NetworkAnomalyDetection {
         c => new OneHotEncoder()
           .setInputCol(s"${c}_index")
           .setOutputCol(s"${c}_vec")
+          .setDropLast(false)
       ).toArray
 
       // Creation of list of columns for vector assembler (with only numerical columns)
@@ -434,6 +559,7 @@ object NetworkAnomalyDetection {
         c => new OneHotEncoder()
           .setInputCol(s"${c}_index")
           .setOutputCol(s"${c}_vec")
+          .setDropLast(false)
       ).toArray
 
       // Creation of list of columns for vector assembler (with only numerical columns)
@@ -508,6 +634,7 @@ object NetworkAnomalyDetection {
         c => new OneHotEncoder()
           .setInputCol(s"${c}_index")
           .setOutputCol(s"${c}_vec")
+          .setDropLast(false)
       ).toArray
 
       // Creation of list of columns for vector assembler (with only numerical columns)
