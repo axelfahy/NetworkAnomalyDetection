@@ -14,6 +14,15 @@ Program can be run using Intellij or with sbt and spark-submit:
 
 This project has been developped using DataFrames from Spark MLlib.
 
+
+## Data
+
+The datasets used for the training phase contain 4,898,431 packets, and its size is of 743 MB. Here is a preview of the data:
+
+```0,tcp,http,SF,215,45076,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,1,1,0.00,0.00,0.00,0.00,1.00,0.00,0.00,0,0,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,normal.```
+
+The data come from a competition held in 1999 by KDD Cup organization (i.e. an organisation bringing together professional data miners). The competition was about creating a model capable to detect anomalies in network traffic. The packets available were gathered from an US military network.
+
 ## Preprocessing
 
 - **Numerical features**: at first, only numerical features were used as features.
