@@ -117,6 +117,7 @@ object NetworkAnomalyDetection {
       .set("spark.driver.memory", "6g")
 
     val sc = new SparkContext(conf)
+    sc.setCheckpointDir("checkpoints/")
 
     val spark = SparkSession
       .builder()
@@ -152,7 +153,7 @@ object NetworkAnomalyDetection {
     import spark.implicits._
 
     // Select only numerical features
-    val CategoricalColumns = Seq("protocol_type", "service", "flag")
+    val CategoricalColumns = Seq("label", "protocol_type", "service", "flag")
 
     /**
       * Calculate the Euclidean distance between a data point and its centroid
@@ -279,8 +280,8 @@ object NetworkAnomalyDetection {
     def getAnomalies(pipeline: PipelineModel, data: DataFrame, centroids: Array[Vector], max: Map[Int, Double]) = {
       val predictDF = pipeline.transform(data)
 
-      val distanceDF = predictDF.withColumn("dist", calculateDistance(centroids)(predictDF("features"), predictDF("prediction")))
-      val anomalies = distanceDF.withColumn("anomaly", checkAnomaly(max)(distanceDF("dist"), distanceDF("prediction")))
+      val distanceDF = predictDF.withColumn("dist", calculateDistance(centroids)(predictDF("features"), predictDF("prediction"))).checkpoint()
+      val anomalies = distanceDF.withColumn("anomaly", checkAnomaly(max)(distanceDF("dist"), distanceDF("prediction"))).checkpoint()
       anomalies.filter($"anomaly" > 0)
     }
 
@@ -303,6 +304,9 @@ object NetworkAnomalyDetection {
         .schema(DataSchema)
         .load(TestPath)
 
+      val testDF = dataTestDF.drop("label")
+      testDF.cache()
+
       // Prediction
       val cluster = pipelineModel.transform(dataDF)
 
@@ -315,7 +319,9 @@ object NetworkAnomalyDetection {
       val max = this.maxByCentroid(centroids, cluster, k)
 
       // Detect anomalies on the test data
-      getAnomalies(pipelineModel, dataTestDF, centroids, max)
+      val anomalies = getAnomalies(pipelineModel, testDF, centroids, max)
+      testDF.unpersist()
+      anomalies
     }
 
     /**
@@ -388,8 +394,10 @@ object NetworkAnomalyDetection {
 
       // Anomaly detection
       val anomalies = this.anomalyDectection(dataDF, pipelineModel, k)
-      println("Anomalies: " + anomalies.count())
-      anomalies.collect.foreach(println)
+      // Save results to json file
+      val format = new SimpleDateFormat("yyyyMMddHHmm")
+      Thread.sleep(1000)
+      anomalies.write.json("anomalies_" + format.format(Calendar.getInstance().getTime) + "_" + k + ".json")
       dataDF.unpersist()
     }
 
